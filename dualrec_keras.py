@@ -144,23 +144,15 @@ def build_sequences(
 def build_lstm_model(config: MovieLensConfig, num_movies: int) -> keras.Model:
     """Build the Stage 1 multimodal LSTM model."""
     movie_ids = keras.Input(shape=(config.sequence_length,), name="movie_ids", dtype="int32")
-    title_tokens = keras.Input(
-        shape=(config.sequence_length, config.title_max_tokens), name="title_tokens", dtype="int32"
-    )
+    title_tokens = keras.Input(shape=(config.sequence_length, config.title_max_tokens), name="title_tokens", dtype="int32")
     genre_inputs = keras.Input(shape=(config.sequence_length, len(config.genre_labels)), name="genres")
 
     movie_embed = layers.Embedding(num_movies + 1, config.movie_embedding_dim, name="movie_embedding")(movie_ids)
 
-    title_embed = layers.TimeDistributed(
-        layers.Embedding(config.title_vocab_size, config.title_embedding_dim), name="title_embedding"
-    )(title_tokens)
-    title_repr = layers.TimeDistributed(
-        layers.GlobalAveragePooling1D(), name="title_pooling"
-    )(title_embed)
+    title_embed = layers.TimeDistributed(layers.Embedding(config.title_vocab_size, config.title_embedding_dim), name="title_embedding")(title_tokens)
+    title_repr = layers.TimeDistributed(layers.GlobalAveragePooling1D(), name="title_pooling")(title_embed)
 
-    genre_repr = layers.TimeDistributed(
-        layers.Dense(config.genre_embedding_dim, activation="relu"), name="genre_dense"
-    )(genre_inputs)
+    genre_repr = layers.TimeDistributed(layers.Dense(config.genre_embedding_dim, activation="relu"), name="genre_dense")(genre_inputs)
 
     fused = layers.Concatenate(name="feature_concat")([movie_embed, title_repr, genre_repr])
 
