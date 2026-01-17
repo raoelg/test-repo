@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import requests
 import tensorflow as tf
+import tensorflow_hub as hub
 from tensorflow import keras
 from tensorflow.keras import layers
 
@@ -155,23 +156,15 @@ def build_sequences(
 def build_lstm_model(config: MovieLensConfig, num_movies: int) -> keras.Model:
     """Build the Stage 1 multimodal LSTM model."""
     movie_ids = keras.Input(shape=(config.sequence_length,), name="movie_ids", dtype="int32")
-    title_tokens = keras.Input(
-        shape=(config.sequence_length, config.title_max_tokens), name="title_tokens", dtype="int32"
-    )
+    title_tokens = keras.Input(shape=(config.sequence_length, config.title_max_tokens), name="title_tokens", dtype="int32")
     genre_inputs = keras.Input(shape=(config.sequence_length, len(config.genre_labels)), name="genres")
 
     movie_embed = layers.Embedding(num_movies + 1, config.movie_embedding_dim, name="movie_embedding")(movie_ids)
 
-    title_embed = layers.TimeDistributed(
-        layers.Embedding(config.title_vocab_size, config.title_embedding_dim), name="title_embedding"
-    )(title_tokens)
-    title_repr = layers.TimeDistributed(
-        layers.GlobalAveragePooling1D(), name="title_pooling"
-    )(title_embed)
+    title_embed = layers.TimeDistributed(layers.Embedding(config.title_vocab_size, config.title_embedding_dim), name="title_embedding")(title_tokens)
+    title_repr = layers.TimeDistributed(layers.GlobalAveragePooling1D(), name="title_pooling")(title_embed)
 
-    genre_repr = layers.TimeDistributed(
-        layers.Dense(config.genre_embedding_dim, activation="relu"), name="genre_dense"
-    )(genre_inputs)
+    genre_repr = layers.TimeDistributed(layers.Dense(config.genre_embedding_dim, activation="relu"), name="genre_dense")(genre_inputs)
 
     fused = layers.Concatenate(name="feature_concat")([movie_embed, title_repr, genre_repr])
 
@@ -213,6 +206,123 @@ def call_openrouter(prompt: str, api_key: str, model: str) -> str:
     )
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
+
+
+class LoRADense(layers.Layer):
+    """Dense layer with a LoRA adaptation for parameter-efficient fine-tuning."""
+
+    def __init__(self, units: int, rank: int, alpha: float, dropout: float = 0.0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.units = units
+        self.rank = rank
+        self.alpha = alpha
+        self.dropout = dropout
+        self.scaling = alpha / rank
+        self.base_dense = layers.Dense(units, use_bias=False, trainable=False)
+        self.lora_a = layers.Dense(rank, use_bias=False)
+        self.lora_b = layers.Dense(units, use_bias=False)
+        self.lora_dropout = layers.Dropout(dropout)
+
+    def call(self, inputs: tf.Tensor, training: bool = False) -> tf.Tensor:
+        base = self.base_dense(inputs)
+        lora = self.lora_b(self.lora_a(self.lora_dropout(inputs, training=training)))
+        return base + lora * self.scaling
+
+
+class LoRAMultiHeadAttention(layers.Layer):
+    """Multi-head attention with LoRA applied to projection matrices."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        key_dim: int,
+        rank: int,
+        alpha: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+        self.rank = rank
+        self.alpha = alpha
+        self.dropout = dropout
+        self.scale = key_dim ** -0.5
+
+        self.query_proj = LoRADense(num_heads * key_dim, rank, alpha, dropout, name="q_proj")
+        self.key_proj = LoRADense(num_heads * key_dim, rank, alpha, dropout, name="k_proj")
+        self.value_proj = LoRADense(num_heads * key_dim, rank, alpha, dropout, name="v_proj")
+        self.out_proj = LoRADense(num_heads * key_dim, rank, alpha, dropout, name="o_proj")
+        self.attn_dropout = layers.Dropout(dropout)
+
+    def _reshape_heads(self, x: tf.Tensor) -> tf.Tensor:
+        batch = tf.shape(x)[0]
+        seq_len = tf.shape(x)[1]
+        x = tf.reshape(x, [batch, seq_len, self.num_heads, self.key_dim])
+        return tf.transpose(x, [0, 2, 1, 3])
+
+    def call(self, query: tf.Tensor, key: tf.Tensor, value: tf.Tensor, training: bool = False) -> tf.Tensor:
+        q = self._reshape_heads(self.query_proj(query, training=training))
+        k = self._reshape_heads(self.key_proj(key, training=training))
+        v = self._reshape_heads(self.value_proj(value, training=training))
+
+        scores = tf.matmul(q, k, transpose_b=True) * self.scale
+        weights = tf.nn.softmax(scores, axis=-1)
+        weights = self.attn_dropout(weights, training=training)
+
+        context = tf.matmul(weights, v)
+        context = tf.transpose(context, [0, 2, 1, 3])
+        context = tf.reshape(context, [tf.shape(context)[0], tf.shape(context)[1], -1])
+
+        return self.out_proj(context, training=training)
+
+
+class CausalTransformerBlock(layers.Layer):
+    """Transformer block with causal masking and LoRA attention."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        mlp_dim: int,
+        rank: int,
+        alpha: float,
+        dropout: float = 0.1,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.attn = LoRAMultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=hidden_dim // num_heads,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+            name="lora_attention",
+        )
+        self.ffn = keras.Sequential(
+            [
+                layers.Dense(mlp_dim, activation="gelu"),
+                layers.Dropout(dropout),
+                layers.Dense(hidden_dim),
+            ],
+            name="mlp",
+        )
+        self.norm_1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm_2 = layers.LayerNormalization(epsilon=1e-6)
+        self.dropout = layers.Dropout(dropout)
+
+    def call(self, x: tf.Tensor, training: bool = False) -> tf.Tensor:
+        seq_len = tf.shape(x)[1]
+        causal_mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
+        causal_mask = tf.reshape(causal_mask, [1, 1, seq_len, seq_len])
+
+        attn_out = self.attn(x, x, x, training=training)
+        x = x + self.dropout(attn_out, training=training)
+        x = self.norm_1(x)
+
+        ffn_out = self.ffn(x, training=training)
+        x = x + self.dropout(ffn_out, training=training)
+        return self.norm_2(x)
 
 
 def build_lora_causal_lm(
@@ -291,18 +401,12 @@ def build_instruction_dataset(
 
 
 def compute_similarity_rerank(
-    lstm_title: str, generated_titles: List[str]
+    lstm_title: str, generated_titles: List[str], encoder_url: str = "https://tfhub.dev/google/universal-sentence-encoder/4"
 ) -> List[Tuple[str, float]]:
     """Re-rank generated titles by semantic similarity to LSTM prediction."""
-    vectorizer = layers.TextVectorization(output_sequence_length=50)
-    vectorizer.adapt([lstm_title] + generated_titles)
-
-    def encode(texts: List[str]) -> tf.Tensor:
-        tokens = vectorizer(texts)
-        return tf.cast(tokens, tf.float32)
-
-    lstm_embedding = encode([lstm_title])
-    title_embeddings = encode(generated_titles)
+    encoder = hub.load(encoder_url)
+    lstm_embedding = encoder([lstm_title])
+    title_embeddings = encoder(generated_titles)
 
     lstm_norm = tf.math.l2_normalize(lstm_embedding, axis=1)
     title_norm = tf.math.l2_normalize(title_embeddings, axis=1)
