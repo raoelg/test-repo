@@ -12,6 +12,7 @@ stack and avoids PyTorch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Tuple
 
 import numpy as np
@@ -56,9 +57,20 @@ class MovieLensConfig:
 
 
 def load_movielens_1m(config: MovieLensConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load MovieLens 1M ratings and movies metadata."""
-    ratings_path = f"{config.data_dir}/ratings.dat"
-    movies_path = f"{config.data_dir}/movies.dat"
+    """Load MovieLens 1M ratings and movies metadata.
+
+    Downloads and extracts the dataset if it is not already available.
+    """
+    data_root = keras.utils.get_file(
+        fname="ml-1m.zip",
+        origin="https://files.grouplens.org/datasets/movielens/ml-1m.zip",
+        extract=True,
+        cache_dir=config.data_dir,
+        cache_subdir=".",
+    )
+    data_root = Path(data_root).with_suffix("")
+    ratings_path = data_root / "ratings.dat"
+    movies_path = data_root / "movies.dat"
 
     ratings = pd.read_csv(
         ratings_path,
@@ -333,15 +345,33 @@ def build_lora_causal_lm(
     x = token_embed + position_embed
 
     for idx in range(num_layers):
-        x = CausalTransformerBlock(
-            hidden_dim=hidden_dim,
+        attn_layer = layers.MultiHeadAttention(
             num_heads=num_heads,
-            mlp_dim=mlp_dim,
-            rank=rank,
-            alpha=alpha,
+            key_dim=hidden_dim // num_heads,
             dropout=dropout,
-            name=f"transformer_block_{idx}",
-        )(x)
+            name=f"mha_{idx}",
+        )
+        attn_out = attn_layer(x, x, use_causal_mask=True)
+
+        lora_down = layers.Dense(rank, use_bias=False, name=f"lora_down_{idx}")(x)
+        lora_down = layers.Dropout(dropout, name=f"lora_dropout_{idx}")(lora_down)
+        lora_up = layers.Dense(hidden_dim, use_bias=False, name=f"lora_up_{idx}")(lora_down)
+        lora_scaled = layers.Lambda(lambda t: t * (alpha / rank), name=f"lora_scale_{idx}")(lora_up)
+
+        x = layers.Add(name=f"attn_residual_{idx}")([x, attn_out, lora_scaled])
+        x = layers.LayerNormalization(epsilon=1e-6, name=f"attn_norm_{idx}")(x)
+
+        ffn = keras.Sequential(
+            [
+                layers.Dense(mlp_dim, activation="gelu"),
+                layers.Dropout(dropout),
+                layers.Dense(hidden_dim),
+            ],
+            name=f"ffn_{idx}",
+        )
+        ffn_out = ffn(x)
+        x = layers.Add(name=f"ffn_residual_{idx}")([x, ffn_out])
+        x = layers.LayerNormalization(epsilon=1e-6, name=f"ffn_norm_{idx}")(x)
 
     logits = layers.Dense(vocab_size, name="lm_head")(x)
     return keras.Model(tokens, logits, name="lora_causal_lm")
